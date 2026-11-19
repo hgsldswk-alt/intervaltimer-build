@@ -1,0 +1,265 @@
+import XCTest
+
+final class FlowUITests: XCTestCase {
+    enum Language: String, CaseIterable {
+        case hans = "zh-Hans", en, hant = "zh-Hant"
+
+        var locale: String {
+            switch self {
+            case .hans: "zh_CN"
+            case .en: "en_US"
+            case .hant: "zh_TW"
+            }
+        }
+    }
+
+    private var app: XCUIApplication!
+    private var storeID = ""
+
+    override func setUp() {
+        super.setUp()
+        continueAfterFailure = false
+        app = XCUIApplication()
+        storeID = UUID().uuidString
+    }
+
+    private func launch(_ args: [String] = [], language: Language = .hans, text: String? = nil, reset: Bool = true) {
+        app.launchArguments = ["-ui-testing", "-AppleLanguages", "(\(language.rawValue))",
+                               "-AppleLocale", language.locale] + (reset ? ["-reset"] : []) + args
+        app.launchEnvironment = ["INTERVAL_TEST_STORE": storeID]
+        if let text { app.launchEnvironment["INTERVAL_TEST_TEXT"] = text }
+        app.launch()
+    }
+
+    private func tap(_ id: String) {
+        let button = app.buttons[id].firstMatch
+        if id == "timer.confirmEnd", !button.waitForExistence(timeout: 3) {
+            let p = NSPredicate(format: "label IN %@ AND identifier != 'timer.end'", ["结束训练", "End workout", "結束訓練"])
+            let alt = app.buttons.matching(p).firstMatch
+            XCTAssertTrue(alt.waitForExistence(timeout: 8), id)
+            alt.tap()
+            return
+        }
+        XCTAssertTrue(button.waitForExistence(timeout: 8), id)
+        button.tap()
+    }
+
+    private func require(_ id: String) {
+        XCTAssertTrue(app.descendants(matching: .any)[id].firstMatch.waitForExistence(timeout: 8), id)
+    }
+
+    private func shot(_ name: String) {
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    private func shortCode(_ name: String = "Coach intervals", work: Int = 5) -> String {
+        let bytes = try! JSONSerialization.data(withJSONObject: [
+            "version": 1, "name": name, "work": work, "rest": 0, "rounds": 1, "prepare": 0, "cooldown": 0
+        ])
+        let code = bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+        return "Copy this plan\nINTERVAL1:\(code)"
+    }
+
+    func testDefaultStartPauseResumeEndAndHistory() {
+        launch()
+        require("home.plan.name")
+        XCTAssertEqual(app.alerts.count, 0)
+        tap("home.start")
+        require("timer.remaining")
+        tap("timer.toggle")
+        require("timer.paused")
+        let paused = app.staticTexts["timer.remaining"].label
+        XCTAssertTrue(app.staticTexts["timer.remaining"].waitForExistence(timeout: 1))
+        XCTAssertEqual(app.staticTexts["timer.remaining"].label, paused)
+        tap("timer.toggle")
+        XCTAssertFalse(app.staticTexts["timer.paused"].exists)
+        tap("timer.end")
+        tap("timer.confirmEnd")
+        require("result.card")
+        tap("result.back")
+        tap("tab.records")
+        let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "record.")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.tap()
+        require("result.card")
+        tap("result.back")
+        XCTAssertTrue(row.exists)
+    }
+
+    func testSwitchPresetAndRelaunchPausedKeepsPlan() {
+        launch()
+        tap("plan.00000000-0000-4000-8000-000000000002")
+        tap("home.start")
+        tap("timer.toggle")
+        require("timer.paused")
+        app.terminate()
+        launch(reset: false)
+        require("timer.paused")
+        XCTAssertTrue(app.staticTexts["20 / 10 短间歇"].exists)
+        tap("timer.end")
+        tap("timer.confirmEnd")
+        tap("result.back")
+        XCTAssertEqual(app.staticTexts["home.plan.name"].label, "20 / 10 短间歇")
+        tap("home.start")
+        require("timer.phase")
+    }
+
+    func testCreatePlanAndShareCode() {
+        launch(language: .en)
+        tap("home.new")
+        let field = app.textFields["editor.name"]
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        field.typeText("Power intervals\n")
+        if !app.buttons["editor.save"].isHittable { app.swipeUp() }
+        tap("editor.save")
+        XCTAssertEqual(app.staticTexts["home.plan.name"].label, "Power intervals")
+        tap("home.share")
+        tap("planShare.copy")
+        require("planShare.copied")
+        tap("sheet.close")
+        tap("home.import")
+        let paste = app.descendants(matching: .any)["import.paste"].firstMatch
+        XCTAssertTrue(paste.waitForExistence(timeout: 5))
+        paste.tap()
+        require("import.preview")
+        tap("import.only")
+        require("home.plan.name")
+        XCTAssertEqual(app.staticTexts["home.plan.name"].label, "Power intervals")
+    }
+
+    func testInvalidCodeLeavesHomeUntouched() {
+        launch(text: "Line one\nINTERVAL1:broken*")
+        tap("home.import")
+        tap("import.testCode")
+        require("import.invalid")
+        XCTAssertFalse(app.buttons["import.start"].exists)
+        tap("sheet.close")
+        XCTAssertEqual(app.staticTexts["home.plan.name"].label, "40 / 20 循环")
+    }
+
+    func testFilePreviewAndImportOnlyWhileActive() {
+        launch(["-test-file", "-stage-shot"])
+        require("import.preview")
+        XCTAssertFalse(app.buttons["import.start"].exists)
+        tap("import.only")
+        require("timer.remaining")
+        tap("timer.end")
+        tap("timer.confirmEnd")
+        tap("result.back")
+        XCTAssertEqual(app.staticTexts["home.plan.name"].label, "File fixture")
+    }
+
+    func testFilePreviewCanStartWithoutAnActiveWorkout() {
+        launch(["-test-file"])
+        require("import.preview")
+        tap("import.start")
+        require("timer.phase")
+        XCTAssertTrue(app.staticTexts["File fixture"].exists)
+    }
+
+    func testImportedWorkoutCompletesAutomaticallyAndShowsMilestone() {
+        launch(["-milestone"], text: shortCode())
+        tap("home.import")
+        tap("import.testCode")
+        tap("import.start")
+        require("timer.remaining")
+        require("result.milestone")
+        require("result.shareMilestone")
+        tap("result.copy")
+        require("result.share")
+        tap("result.back")
+        tap("tab.records")
+        let rows = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "record."))
+        XCTAssertTrue(rows.firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(rows.firstMatch.label.contains("Coach intervals"))
+    }
+
+    func testExpiredImportsAndRunsButGatesEditAndVoice() {
+        launch(["-expired"], text: shortCode("Expired import", work: 60)) // 5 秒方案会在点确认前自己结束（11-19 云端竞态）
+        XCTAssertFalse(app.staticTexts["paywall.title"].exists)
+        tap("home.import")
+        tap("import.testCode")
+        tap("import.only")
+        tap("home.start")
+        require("timer.phase")
+        tap("timer.end")
+        tap("timer.confirmEnd")
+        tap("result.back")
+        tap("home.share")
+        tap("planShare.copy")
+        require("planShare.copied")
+        tap("sheet.close")
+        tap("home.edit")
+        require("paywall.title")
+        tap("sheet.close")
+        tap("tab.settings")
+        tap("settings.voice")
+        require("paywall.title")
+    }
+
+    func testEnglishAccessibilityTextKeepsPrimaryControlReachable() {
+        launch(["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityM"], language: .en)
+        require("home.plan.name")
+        tap("home.start")
+        require("timer.remaining")
+        XCTAssertTrue(app.buttons["timer.toggle"].isHittable)
+    }
+
+    func testResultOpensSystemShare() {
+        launch(["-result-shot"], language: .en)
+        let share = app.buttons["result.share"]
+        XCTAssertTrue(share.waitForExistence(timeout: 5))
+        share.tap()
+        let deadline = Date().addingTimeInterval(10)
+        var opened = false
+        while Date() < deadline && !opened {
+            opened = !share.isHittable || app.otherElements["ActivityListView"].exists
+                || app.navigationBars["UIActivityContentView"].exists || app.sheets.count > 0
+            if !opened { usleep(300_000) }
+        }
+        XCTAssertTrue(opened)
+    }
+
+    func testStoreScreenshots() {
+        for language in Language.allCases {
+            let prefix = "store-\(language.rawValue)-"
+            launch(["-home-shot"], language: language)
+            require("home.plan.name")
+            XCTAssertTrue(app.buttons["home.start"].isHittable)
+            shot(prefix + "01-home")
+            launch(["-stage-shot"], language: language)
+            require("timer.remaining")
+            XCTAssertTrue(app.staticTexts["timer.round"].label.contains("3"))
+            XCTAssertTrue(app.staticTexts["timer.remaining"].label.contains("26"))
+            shot(prefix + "02-timer")
+            launch(language: language)
+            tap("home.share")
+            require("planShare.file")
+            require("planShare.copy")
+            shot(prefix + "03-plan-share")
+            launch(["-history-shot"], language: language)
+            tap("tab.records")
+            XCTAssertTrue(app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "record."))
+                .firstMatch.waitForExistence(timeout: 5))
+            shot(prefix + "04-history")
+            launch(["-result-shot"], language: language)
+            require("result.card")
+            XCTAssertTrue(app.buttons["result.share"].isHittable)
+            shot(prefix + "05-result")
+        }
+    }
+
+    func testPaidScreenshot() {
+        launch(["-paid-mode", "-paywall"])
+        require("paywall.title")
+        require("paywall.buy")
+        require("paywall.trial")
+        require("paywall.restore")
+        shot("paid-01-paywall")
+    }
+}
